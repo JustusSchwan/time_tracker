@@ -6,6 +6,7 @@ The tracker creates a folder ~/time_tracker/ with one csv file for each day.
 The file lists the start times for each of your tasks and the tracker can print a summary at the end
 of the day.
 """
+import copy
 import shutil
 import sys
 import argparse
@@ -23,13 +24,18 @@ def cmdline_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
 
+    p.add_argument("-f", "--filename", required=False, default=str(date.today()),
+                   help="The filename to read/write, defaults to today")
+
+    p.add_argument("-v", "--verbose", action="store_true", help="Tooggle verbose")
+
     subp = p.add_subparsers(help="Modes", dest="mode")
 
     read = subp.add_parser("read", help="Print or summarize the time sheet for today")
 
     write = subp.add_parser("write", help="Add an entry to the time sheet for today")
 
-    write.add_argument("description", default="", type=str,
+    write.add_argument("description", default="", type=str, nargs='?',
                        help="Informal description of the task")
 
     write.add_argument("-s", "--stop",
@@ -46,9 +52,18 @@ def cmdline_args():
                        help="Indicate that the current task is minor, "
                             "its duration will be distributed among other tasks")
 
-    p.add_argument("-v", "--verbose", action="store_true", help="Tooggle verbose")
+    write.add_argument("-r", "--resume", type=int, required=False,
+                       help="Resume the last n-th task, a value of 0 resumes the first task, 1 the second. "
+                            "A negative value starts from the back, -1 resumes the current task, -2 the task before "
+                            "that. "
+                            "The time field will not be taken from the resumed task.")
 
-    return p.parse_args()
+    ret = p.parse_args()
+
+    if ret.mode == "write" and ret.stop is False and ret.resume is None and ret.description == "":
+        p.error("The description must not be omitted for a regular task (not stop or resume)")
+
+    return ret
 
 
 @dataclass
@@ -69,8 +84,8 @@ class CsvEntry:
 CsvFields = [fld.name for fld in fields(CsvEntry)]
 
 
-def filename():
-    return pathlib.Path.home() / 'time_tracker' / f'{date.today()}.csv'
+def full_filepath(filename: str):
+    return pathlib.Path.home() / 'time_tracker' / f'{filename}.csv'
 
 
 def log(verbose: bool, *args):
@@ -78,17 +93,17 @@ def log(verbose: bool, *args):
         print(*args)
 
 
-def read_entries() -> List[CsvEntry]:
-    if not os.path.exists(filename()):
+def read_entries(filename: str) -> List[CsvEntry]:
+    if not os.path.exists(full_filepath(filename)):
         return []
 
-    with open(filename(), newline='') as csvread:
+    with open(full_filepath(filename), newline='') as csvread:
         reader = csv.DictReader(csvread, CsvFields)
         return [CsvEntry(**d) for d in list(reader)[1:]]
 
 
-def write_entries(entries: List[CsvEntry], verbose: bool):
-    f = filename()
+def write_entries(entries: List[CsvEntry], filename: str, verbose: bool):
+    f = full_filepath(filename)
     time_dir = pathlib.Path(os.path.dirname(f))
     backup_dir = time_dir / 'backup'
     if not os.path.exists(time_dir):
@@ -101,24 +116,29 @@ def write_entries(entries: List[CsvEntry], verbose: bool):
         log(verbose, 'Backing up', f, 'as', backup_path)
         shutil.copy(f, backup_dir / f'{os.path.basename(f)}.{datetime.now().strftime("%H%M%S")}')
 
-    with open(filename(), 'w', newline='') as csvwrite:
+    with open(full_filepath(filename), 'w', newline='') as csvwrite:
         log(verbose, 'Writing modified entries to', f)
         writer = csv.DictWriter(csvwrite, CsvFields)
         writer.writeheader()
         writer.writerows((asdict(entry) for entry in entries))
 
 
-def add_entry(entries: List[CsvEntry], args) -> List[CsvEntry]:
+def add_entry(entries: List[CsvEntry], args) -> None:
     timestamp = datetime.combine(date.today(), datetime.strptime(args.time, '%H:%M').time()) \
         if args.time is not None \
         else datetime.now()
     timestr = timestamp.strftime('%H:%M')
     log(args.verbose, "Logging Time", timestr)
-    context = args.context if args.context is not None else args.description
-    if not args.stop:
-        entries.append(CsvEntry(args.description, timestr, context, False, args.minor))
+    if args.resume is not None:
+        try:
+            entries.append(copy.deepcopy(entries[args.resume]))
+        except IndexError:
+            raise IndexError(
+                f"Attempted to resume task {args.resume}, but there are only {len(entries)} entries")
+        entries[-1].start_time = timestr
     else:
-        entries.append(CsvEntry("", timestr, context, True, args.minor))
+        context = args.context if args.context is not None else args.description
+        entries.append(CsvEntry(args.description, timestr, context, args.stop, args.minor))
 
     entries.sort(key=lambda e: e.start_time)
 
@@ -127,20 +147,20 @@ def format_table_dict(entries: list[Dict[str, Any]]):
     if len(entries) == 0:
         return ""
 
-    def format(x: Any):
+    def format_any(x: Any):
         if type(x) is float:
             return '{:.2f}'.format(x)
         return str(x)
 
     widths: List[int] = [0] * len(entries[0].items())
     for entry in entries:
-        entry_length = (max(len(k), len(format(v))) for k, v in entry.items())
+        entry_length = (max(len(k), len(format_any(v))) for k, v in entry.items())
         widths = [max(a, b) for a, b in zip(widths, entry_length)]
 
     s = ' '.join((k.ljust(w) for k, w in zip(entries[0].keys(), widths))) + "\n"
     s += ' '.join(('-' * w for w in widths)) + "\n"
     for entry in entries:
-        s += ' '.join((format(e).ljust(w) for e, w in zip(entry.values(), widths))) + "\n"
+        s += ' '.join((format_any(e).ljust(w) for e, w in zip(entry.values(), widths))) + "\n"
     return s
 
 
@@ -205,25 +225,29 @@ def print_summary(entries: List[CsvEntry]):
 
 
 def print_entries(entries: List[CsvEntry]):
-    print(format_table(entries))
+    print(format_table_dict([{'index': i} | asdict(e) for i, e in enumerate(entries)]))
     print_summary(entries)
 
 
-if __name__ == '__main__':
+def main():
     try:
         args = cmdline_args()
         log(args.verbose, "Arguments: ", args)
-        log(args.verbose, "Opening", filename())
-        entries = read_entries()
+        log(args.verbose, "Opening", full_filepath(args.filename))
+        entries = read_entries(args.filename)
         entries.sort(key=lambda e: e.start_time)
         log(args.verbose, f"Entries\n{format_table(entries)}")
         if args.mode == 'write':
             add_entry(entries, args)
             print(f"New Entries:\n{format_table(entries)}")
-            write_entries(entries, args.verbose)
+            write_entries(entries, args.filename, args.verbose)
         elif args.mode == 'read':
             print_entries(entries)
 
-    except Exception as e:
-        print(f'Error {e}')
+    except Exception as ex:
+        print(f'Error {ex}')
         traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
